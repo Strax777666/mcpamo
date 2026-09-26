@@ -219,7 +219,7 @@ def _leads(date_from: str, date_to: str, pipeline_id: int | None = None,
     params: list[tuple[str, Any]] = [
         ("filter[created_at][from]", _ts(date_from)),
         ("filter[created_at][to]", _ts(date_to, end=True)),
-        ("with", "loss_reason"),
+        ("with", "loss_reason,contacts"),
     ]
     if pipeline_id:
         params.append(("filter[pipeline_id][]", pipeline_id))
@@ -239,15 +239,20 @@ def _events(date_from_ts: int, date_to_ts: int, types: list[str]) -> list[dict]:
     return _cached(key, 600, lambda: _get_all("/events", "events", params, max_pages=2000))
 
 
-def _call_notes(date_from_ts: int, date_to_ts: int) -> list[dict]:
+def _call_notes(date_from_ts: int, date_to_ts: int, entity: str = "leads") -> list[dict]:
+    """Звонки-примечания. Телефония может писать их в сделку (leads) или в контакт (contacts)."""
     params: list[tuple[str, Any]] = [
         ("filter[note_type][]", "call_in"),
         ("filter[note_type][]", "call_out"),
         ("filter[updated_at][from]", date_from_ts),
         ("filter[updated_at][to]", date_to_ts),
     ]
-    key = f"notes:{params}"
-    return _cached(key, 600, lambda: _get_all("/leads/notes", "notes", params, max_pages=1000))
+    key = f"notes:{entity}:{params}"
+    return _cached(key, 600, lambda: _get_all(f"/{entity}/notes", "notes", params, max_pages=1000))
+
+
+def _lead_contacts(lead: dict) -> list[int]:
+    return [c["id"] for c in lead.get("_embedded", {}).get("contacts") or []]
 
 
 def _is_work_time(ts: int) -> bool:
@@ -313,16 +318,18 @@ def search_leads(date_from: str, date_to: str, pipeline_id: int | None = None,
 @mcp.tool()
 def get_lead(lead_id: int) -> dict:
     """Одна сделка: основные данные, хронология событий, задачи и звонки."""
-    lead = _get(f"/leads/{lead_id}", {"with": "loss_reason"})
+    lead = _get(f"/leads/{lead_id}", {"with": "loss_reason,contacts"})
     events = _get_all("/events", "events", [
         ("filter[entity]", "lead"), ("filter[entity_id][]", lead_id),
     ] + [("filter[type][]", t) for t in TIMELINE_EVENTS])
     tasks = _get_all("/tasks", "tasks", [
         ("filter[entity_type]", "leads"), ("filter[entity_id][]", lead_id),
     ])
-    notes = _get_all(f"/leads/{lead_id}/notes", "notes", [
-        ("filter[note_type][]", "call_in"), ("filter[note_type][]", "call_out"),
-    ])
+    call_filter = [("filter[note_type][]", "call_in"), ("filter[note_type][]", "call_out")]
+    notes = _get_all(f"/leads/{lead_id}/notes", "notes", call_filter)
+    for cid in _lead_contacts(lead):
+        notes += [n for n in _get_all(f"/contacts/{cid}/notes", "notes", call_filter)
+                  if (n.get("created_at") or 0) >= lead.get("created_at", 0)]
     ref = _reference()
     return {
         "lead": _short_lead(lead),
@@ -414,15 +421,23 @@ def get_funnel_metrics(date_from: str, date_to: str, group_by: str = "channel") 
     t0 = min(ld["created_at"] for ld in leads)
     t1 = int(time.time())
     events = _events(t0, t1, ["lead_status_changed"] + RESPONSE_EVENTS + CONTACT_EVENTS)
-    notes = _call_notes(t0, t1)
     ref = _reference()
 
     by_lead: dict[int, list[dict]] = {}
     for e in events:
         by_lead.setdefault(e["entity_id"], []).append(e)
     calls_by_lead: dict[int, list[dict]] = {}
-    for n in notes:
+    for n in _call_notes(t0, t1, "leads"):
         calls_by_lead.setdefault(n.get("entity_id"), []).append(n)
+    # Звонки, записанные в контакт, засчитываем всем сделкам этого контакта
+    # (фильтр «после создания сделки» ниже отсекает звонки по старым сделкам).
+    leads_by_contact: dict[int, list[int]] = {}
+    for ld in leads:
+        for cid in _lead_contacts(ld):
+            leads_by_contact.setdefault(cid, []).append(ld["id"])
+    for n in _call_notes(t0, t1, "contacts"):
+        for lid in leads_by_contact.get(n.get("entity_id"), []):
+            calls_by_lead.setdefault(lid, []).append(n)
 
     groups: dict[str, dict] = {}
     for ld in leads:
@@ -498,7 +513,8 @@ def get_funnel_metrics(date_from: str, date_to: str, group_by: str = "channel") 
         "notes": [
             "Попытка = первый исходящий звонок или сообщение после создания сделки.",
             f"Контакт = звонок от {CALL_OK_SECONDS} с или входящее сообщение клиента.",
-            "Звонки видны, только если телефония пишет их в amoCRM.",
+            "Звонки видны, только если телефония пишет их в amoCRM (в сделку или в контакт).",
+            "Звонок контакта засчитывается всем его сделкам, созданным до звонка.",
         ],
     }
 
