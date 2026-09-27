@@ -85,7 +85,11 @@ def _get(path: str, params: dict | list | None = None) -> dict:
         if wait > 0:
             time.sleep(wait)
         _last_call = time.monotonic()
-        r = _client.get(path, params=params)
+        try:
+            r = _client.get(path, params=params)
+        except httpx.TransportError:
+            time.sleep(1 + attempt)  # amoCRM иногда рвёт соединение
+            continue
         if r.status_code == 429:
             time.sleep(1 + attempt)
             continue
@@ -461,17 +465,26 @@ def get_funnel_metrics(date_from: str, date_to: str, group_by: str = "channel") 
     for ld in leads:
         for c in _contact_ids(ld):
             leads_by_contact.setdefault(c, []).append(ld["id"])
-    # события чатов у контактов запрашиваем по id (по 10 за раз): запрос без id
-    # amoCRM отдаёт неполностью
+    # события по контактам запрашиваем по id (по 10 за раз). Переписка мессенджеров
+    # приходит в этом ответе с entity_type=lead и id сделки, а запрос по сделкам
+    # без id её не отдаёт
     contact_events = _contact_events_by_ids(sorted(leads_by_contact), t0, t1,
                                             RESPONSE_EVENTS + CONTACT_EVENTS)
 
     by_lead: dict[int, list[dict]] = {}
+    seen: set[int] = set()
     for e in events:
+        seen.add(e["id"])
         by_lead.setdefault(e["entity_id"], []).append(e)
     for e in contact_events:
-        for lid in leads_by_contact.get(e["entity_id"], []):
-            by_lead.setdefault(lid, []).append(e)
+        if e["id"] in seen:
+            continue
+        seen.add(e["id"])
+        if e.get("entity_type") == "lead":
+            by_lead.setdefault(e["entity_id"], []).append(e)
+        elif e.get("entity_type") == "contact":
+            for lid in leads_by_contact.get(e["entity_id"], []):
+                by_lead.setdefault(lid, []).append(e)
     calls_by_lead: dict[int, list[dict]] = {}
     for n in notes:
         calls_by_lead.setdefault(n.get("entity_id"), []).append(n)
