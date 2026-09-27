@@ -31,6 +31,8 @@ CALL_OK_SECONDS = int(os.getenv("CALL_OK_SECONDS", "20"))
 WORK_HOURS = os.getenv("WORK_HOURS", "09:00-19:00")
 WORK_DAYS = {int(x) for x in os.getenv("WORK_DAYS", "1,2,3,4,5,6").split(",")}  # 1=пн ... 7=вс
 HASH_SALT = os.getenv("HASH_SALT", MCP_SECRET)
+# id доп. поля «Причина отказа» (у Про-Лидера 541817). 0 = системное поле amoCRM
+LOSS_REASON_FIELD_ID = int(os.getenv("LOSS_REASON_FIELD_ID", "541817") or 0)
 WRITE_ENABLED = os.getenv("WRITE_ENABLED", "1") == "1"   # 0 = коннектор только читает
 AUDIT_LOG = os.getenv("AUDIT_LOG", "/data/audit.log")
 MAX_BATCH = int(os.getenv("MAX_BATCH", "50"))
@@ -196,10 +198,23 @@ def _channel(lead: dict) -> str:
     return "не указан"
 
 
+def _loss_reason(lead: dict) -> str | None:
+    """Причина отказа: сначала доп. поле, потом системное поле amoCRM."""
+    if LOSS_REASON_FIELD_ID:
+        for f in lead.get("custom_fields_values") or []:
+            if f.get("field_id") == LOSS_REASON_FIELD_ID and f.get("values"):
+                return ", ".join(str(v.get("value")) for v in f["values"] if v.get("value") is not None)
+    reasons = lead.get("_embedded", {}).get("loss_reason") or []
+    return reasons[0]["name"] if reasons else None
+
+
+def _contact_ids(lead: dict) -> list[int]:
+    return [c["id"] for c in lead.get("_embedded", {}).get("contacts") or []]
+
+
 def _short_lead(lead: dict) -> dict:
     ref = _reference()
     st = ref["statuses"].get(lead.get("status_id"), {})
-    reasons = lead.get("_embedded", {}).get("loss_reason") or []
     return {
         "id": lead["id"],
         "channel": _channel(lead),
@@ -209,7 +224,7 @@ def _short_lead(lead: dict) -> dict:
         "price": lead.get("price"),
         "created_at": _iso(lead.get("created_at")),
         "closed_at": _iso(lead.get("closed_at")),
-        "loss_reason": reasons[0]["name"] if reasons else None,
+        "loss_reason": _loss_reason(lead),
         "tags": [t["name"] for t in lead.get("_embedded", {}).get("tags") or []],
     }
 
@@ -219,7 +234,7 @@ def _leads(date_from: str, date_to: str, pipeline_id: int | None = None,
     params: list[tuple[str, Any]] = [
         ("filter[created_at][from]", _ts(date_from)),
         ("filter[created_at][to]", _ts(date_to, end=True)),
-        ("with", "loss_reason"),
+        ("with", "loss_reason,contacts"),
     ]
     if pipeline_id:
         params.append(("filter[pipeline_id][]", pipeline_id))
@@ -229,9 +244,9 @@ def _leads(date_from: str, date_to: str, pipeline_id: int | None = None,
     return _cached(key, 600, lambda: _get_all("/leads", "leads", params))
 
 
-def _events(date_from_ts: int, date_to_ts: int, types: list[str]) -> list[dict]:
+def _events(date_from_ts: int, date_to_ts: int, types: list[str], entity: str = "lead") -> list[dict]:
     params: list[tuple[str, Any]] = [
-        ("filter[entity]", "lead"),
+        ("filter[entity]", entity),
         ("filter[created_at][from]", date_from_ts),
         ("filter[created_at][to]", date_to_ts),
     ] + [("filter[type][]", t) for t in types]
@@ -239,15 +254,15 @@ def _events(date_from_ts: int, date_to_ts: int, types: list[str]) -> list[dict]:
     return _cached(key, 600, lambda: _get_all("/events", "events", params, max_pages=2000))
 
 
-def _call_notes(date_from_ts: int, date_to_ts: int) -> list[dict]:
+def _call_notes(date_from_ts: int, date_to_ts: int, entity: str = "leads") -> list[dict]:
     params: list[tuple[str, Any]] = [
         ("filter[note_type][]", "call_in"),
         ("filter[note_type][]", "call_out"),
         ("filter[updated_at][from]", date_from_ts),
         ("filter[updated_at][to]", date_to_ts),
     ]
-    key = f"notes:{params}"
-    return _cached(key, 600, lambda: _get_all("/leads/notes", "notes", params, max_pages=1000))
+    key = f"notes:{entity}:{params}"
+    return _cached(key, 600, lambda: _get_all(f"/{entity}/notes", "notes", params, max_pages=1000))
 
 
 def _is_work_time(ts: int) -> bool:
@@ -313,16 +328,23 @@ def search_leads(date_from: str, date_to: str, pipeline_id: int | None = None,
 @mcp.tool()
 def get_lead(lead_id: int) -> dict:
     """Одна сделка: основные данные, хронология событий, задачи и звонки."""
-    lead = _get(f"/leads/{lead_id}", {"with": "loss_reason"})
+    lead = _get(f"/leads/{lead_id}", {"with": "loss_reason,contacts"})
     events = _get_all("/events", "events", [
         ("filter[entity]", "lead"), ("filter[entity_id][]", lead_id),
     ] + [("filter[type][]", t) for t in TIMELINE_EVENTS])
+    cids = _contact_ids(lead)[:10]
+    if cids:
+        events += _get_all("/events", "events", [("filter[entity]", "contact")]
+                           + [("filter[entity_id][]", c) for c in cids]
+                           + [("filter[type][]", t) for t in TIMELINE_EVENTS if "call" in t or "chat" in t])
     tasks = _get_all("/tasks", "tasks", [
         ("filter[entity_type]", "leads"), ("filter[entity_id][]", lead_id),
     ])
-    notes = _get_all(f"/leads/{lead_id}/notes", "notes", [
-        ("filter[note_type][]", "call_in"), ("filter[note_type][]", "call_out"),
-    ])
+    call_filter = [("filter[note_type][]", "call_in"), ("filter[note_type][]", "call_out")]
+    notes = _get_all(f"/leads/{lead_id}/notes", "notes", call_filter)
+    for c in cids:
+        notes += _get_all(f"/contacts/{c}/notes", "notes", call_filter)
+    notes.sort(key=lambda n: n.get("created_at") or 0)
     ref = _reference()
     return {
         "lead": _short_lead(lead),
@@ -414,15 +436,29 @@ def get_funnel_metrics(date_from: str, date_to: str, group_by: str = "channel") 
     t0 = min(ld["created_at"] for ld in leads)
     t1 = int(time.time())
     events = _events(t0, t1, ["lead_status_changed"] + RESPONSE_EVENTS + CONTACT_EVENTS)
+    contact_events = _events(t0, t1, RESPONSE_EVENTS + CONTACT_EVENTS, entity="contact")
     notes = _call_notes(t0, t1)
+    contact_notes = _call_notes(t0, t1, entity="contacts")
     ref = _reference()
+
+    # звонки и чаты часто хранятся у контакта: раздаём их сделкам этого контакта
+    leads_by_contact: dict[int, list[int]] = {}
+    for ld in leads:
+        for c in _contact_ids(ld):
+            leads_by_contact.setdefault(c, []).append(ld["id"])
 
     by_lead: dict[int, list[dict]] = {}
     for e in events:
         by_lead.setdefault(e["entity_id"], []).append(e)
+    for e in contact_events:
+        for lid in leads_by_contact.get(e["entity_id"], []):
+            by_lead.setdefault(lid, []).append(e)
     calls_by_lead: dict[int, list[dict]] = {}
     for n in notes:
         calls_by_lead.setdefault(n.get("entity_id"), []).append(n)
+    for n in contact_notes:
+        for lid in leads_by_contact.get(n.get("entity_id"), []):
+            calls_by_lead.setdefault(lid, []).append(n)
 
     groups: dict[str, dict] = {}
     for ld in leads:
@@ -473,8 +509,7 @@ def get_funnel_metrics(date_from: str, date_to: str, group_by: str = "channel") 
             G["contract"] += 1
         if ld.get("status_id") == LOST:
             G["lost"] += 1
-            rs = ld.get("_embedded", {}).get("loss_reason") or []
-            name = rs[0]["name"] if rs else "не указана"
+            name = _loss_reason(ld) or "не указана"
             G["reasons"][name] = G["reasons"].get(name, 0) + 1
 
     out = {}
@@ -544,6 +579,39 @@ def phone_hash(lead_id: int) -> dict:
     return {"lead_id": lead_id, "phone_hashes": sorted(set(hashes))}
 
 
+
+
+@mcp.tool()
+def diagnose_lead_feed(lead_id: int) -> dict:
+    """Диагностика: какие типы примечаний и событий есть у сделки и её контактов.
+    Нужна, чтобы понять, куда телефония и мессенджеры пишут звонки и переписку."""
+    lead = _get(f"/leads/{lead_id}", {"with": "contacts"})
+    out: dict[str, Any] = {"lead_id": lead_id}
+
+    def count(items: list[dict], key: str) -> dict:
+        c: dict[str, int] = {}
+        for it in items:
+            c[str(it.get(key))] = c.get(str(it.get(key)), 0) + 1
+        return c
+
+    out["lead_notes"] = count(_get_all(f"/leads/{lead_id}/notes", "notes", [], max_pages=5), "note_type")
+    out["lead_events"] = count(_get_all("/events", "events", [
+        ("filter[entity]", "lead"), ("filter[entity_id][]", lead_id)], max_pages=5), "type")
+    cids = _contact_ids(lead)[:10]
+    out["contacts"] = len(cids)
+    if cids:
+        cn: list[dict] = []
+        for c in cids:
+            cn += _get_all(f"/contacts/{c}/notes", "notes", [], max_pages=5)
+        out["contact_notes"] = count(cn, "note_type")
+        out["contact_events"] = count(_get_all("/events", "events", [("filter[entity]", "contact")]
+                                               + [("filter[entity_id][]", c) for c in cids], max_pages=5), "type")
+    try:
+        talks = _get_all("/talks", "talks", [("filter[entity_id][]", lead_id), ("filter[entity_type]", "leads")], max_pages=2)
+        out["talks"] = len(talks)
+    except Exception as e:
+        out["talks"] = f"недоступно: {e}"
+    return out
 
 # ---------------------------------------------------------------- изменение данных
 
