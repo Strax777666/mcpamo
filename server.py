@@ -254,6 +254,22 @@ def _events(date_from_ts: int, date_to_ts: int, types: list[str], entity: str = 
     return _cached(key, 600, lambda: _get_all("/events", "events", params, max_pages=2000))
 
 
+def _contact_events_by_ids(contact_ids: list[int], t0: int, t1: int, types: list[str]) -> list[dict]:
+    key = f"cev:{hash(tuple(contact_ids))}:{t0}:{t1}:{types}"
+    def load():
+        out: list[dict] = []
+        for i in range(0, len(contact_ids), 10):
+            chunk = contact_ids[i:i + 10]
+            out += _get_all("/events", "events", [
+                ("filter[entity]", "contact"),
+                ("filter[created_at][from]", t0),
+                ("filter[created_at][to]", t1),
+            ] + [("filter[entity_id][]", c) for c in chunk]
+              + [("filter[type][]", t) for t in types], max_pages=50)
+        return out
+    return _cached(key, 600, load)
+
+
 def _call_notes(date_from_ts: int, date_to_ts: int, entity: str = "leads") -> list[dict]:
     params: list[tuple[str, Any]] = [
         ("filter[note_type][]", "call_in"),
@@ -436,7 +452,6 @@ def get_funnel_metrics(date_from: str, date_to: str, group_by: str = "channel") 
     t0 = min(ld["created_at"] for ld in leads)
     t1 = int(time.time())
     events = _events(t0, t1, ["lead_status_changed"] + RESPONSE_EVENTS + CONTACT_EVENTS)
-    contact_events = _events(t0, t1, RESPONSE_EVENTS + CONTACT_EVENTS, entity="contact")
     notes = _call_notes(t0, t1)
     contact_notes = _call_notes(t0, t1, entity="contacts")
     ref = _reference()
@@ -446,6 +461,10 @@ def get_funnel_metrics(date_from: str, date_to: str, group_by: str = "channel") 
     for ld in leads:
         for c in _contact_ids(ld):
             leads_by_contact.setdefault(c, []).append(ld["id"])
+    # события чатов у контактов запрашиваем по id (по 10 за раз): запрос без id
+    # amoCRM отдаёт неполностью
+    contact_events = _contact_events_by_ids(sorted(leads_by_contact), t0, t1,
+                                            RESPONSE_EVENTS + CONTACT_EVENTS)
 
     by_lead: dict[int, list[dict]] = {}
     for e in events:
