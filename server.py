@@ -27,7 +27,10 @@ TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Moscow"))
 CHANNEL_FIELD_ID = int(os.getenv("CHANNEL_FIELD_ID", "0") or 0)   # доп. поле «Источник», если есть
 MEASURE_STATUS_IDS = {int(x) for x in os.getenv("MEASURE_STATUS_IDS", "").split(",") if x.strip()}
 CONTRACT_STATUS_IDS = {int(x) for x in os.getenv("CONTRACT_STATUS_IDS", "").split(",") if x.strip()}
-CALL_OK_SECONDS = int(os.getenv("CALL_OK_SECONDS", "20"))
+# Sipuni включает гудки в длительность: до ~40 с бывает недозвоном
+CALL_OK_SECONDS = int(os.getenv("CALL_OK_SECONDS", "45"))
+# Основная воронка продаж. Расчёты по умолчанию только по ней
+MAIN_PIPELINE_ID = int(os.getenv("MAIN_PIPELINE_ID", "3388186") or 0)
 WORK_HOURS = os.getenv("WORK_HOURS", "09:00-19:00")
 WORK_DAYS = {int(x) for x in os.getenv("WORK_DAYS", "1,2,3,4,5,6").split(",")}  # 1=пн ... 7=вс
 HASH_SALT = os.getenv("HASH_SALT", MCP_SECRET)
@@ -285,6 +288,13 @@ def _call_notes(date_from_ts: int, date_to_ts: int, entity: str = "leads") -> li
     return _cached(key, 600, lambda: _get_all(f"/{entity}/notes", "notes", params, max_pages=1000))
 
 
+def _pipe(pipeline_id: int | None) -> int | None:
+    """None -> основная воронка, 0 -> все воронки, иначе указанная."""
+    if pipeline_id is None:
+        return MAIN_PIPELINE_ID or None
+    return pipeline_id or None
+
+
 def _is_work_time(ts: int) -> bool:
     d = datetime.fromtimestamp(ts, TZ)
     start, end = WORK_HOURS.split("-")
@@ -328,10 +338,11 @@ def search_leads(date_from: str, date_to: str, pipeline_id: int | None = None,
                  responsible_user_id: int | None = None, status_id: int | None = None,
                  channel: str | None = None, only_open: bool = False,
                  offset: int = 0) -> dict:
-    """Сделки, созданные в период (даты YYYY-MM-DD). Фильтры: воронка, менеджер,
-    этап, канал, только открытые. Возвращает до 250 записей за вызов; для следующих
-    передай offset. Имена и контакты клиентов не возвращаются."""
-    leads = _leads(date_from, date_to, pipeline_id, responsible_user_id)
+    """Сделки, созданные в период (даты YYYY-MM-DD). Фильтры: воронка (по умолчанию
+    основная; 0 = все воронки), менеджер, этап, канал, только открытые. Возвращает
+    до 250 записей за вызов; для следующих передай offset. Имена и контакты клиентов
+    не возвращаются."""
+    leads = _leads(date_from, date_to, _pipe(pipeline_id), responsible_user_id)
     rows = []
     for ld in leads:
         if status_id and ld.get("status_id") != status_id:
@@ -443,14 +454,18 @@ def get_unsorted(offset: int = 0) -> dict:
 
 
 @mcp.tool()
-def get_funnel_metrics(date_from: str, date_to: str, group_by: str = "channel") -> dict:
+def get_funnel_metrics(date_from: str, date_to: str, group_by: str = "channel",
+                       pipeline_id: int | None = None) -> dict:
     """Главные показатели воронки за период (даты YYYY-MM-DD), по сделкам, созданным
     в этот период. group_by: channel | manager | month.
     Возвращает: число заявок; время до первой попытки ответа и до первого
     состоявшегося контакта (медиана и 90-й перцентиль, минуты) отдельно для рабочего
     и нерабочего времени; долю заявок без ответа; число исходящих звонков до контакта;
-    конверсию в замер и договор; причины отказов."""
-    leads = _leads(date_from, date_to)
+    конверсию в замер и договор; причины отказов.
+    pipeline_id: по умолчанию только основная воронка продаж; 0 = все воронки
+    (включая служебные копии — для анализа продаж не использовать)."""
+    pipe = _pipe(pipeline_id)
+    leads = _leads(date_from, date_to, pipe)
     if not leads:
         return {"groups": {}, "note": "За период сделок нет."}
     t0 = min(ld["created_at"] for ld in leads)
@@ -561,7 +576,9 @@ def get_funnel_metrics(date_from: str, date_to: str, group_by: str = "channel") 
             "loss_reasons": dict(sorted(G["reasons"].items(), key=lambda kv: -kv[1])),
         }
     return {
-        "period": [date_from, date_to], "group_by": group_by, "groups": out,
+        "period": [date_from, date_to], "group_by": group_by,
+        "pipeline": _reference()["pipelines"].get(pipe, "все воронки") if pipe else "все воронки",
+        "groups": out,
         "notes": [
             "Попытка = первый исходящий звонок или сообщение после создания сделки.",
             f"Контакт = звонок от {CALL_OK_SECONDS} с или входящее сообщение клиента.",
@@ -572,16 +589,21 @@ def get_funnel_metrics(date_from: str, date_to: str, group_by: str = "channel") 
 
 @mcp.tool()
 def find_stalled_leads(days_without_activity: int = 3, status_id: int | None = None,
-                       offset: int = 0) -> dict:
+                       pipeline_id: int | None = None, offset: int = 0) -> dict:
     """Открытые сделки без открытой задачи или без изменений дольше N дней.
-    Это кандидаты на дожим, которые сейчас никто не ведёт."""
+    Это кандидаты на дожим, которые сейчас никто не ведёт. По умолчанию только
+    основная воронка; 0 = все воронки."""
     now = int(time.time())
     params: list[tuple[str, Any]] = [("filter[updated_at][to]", now - days_without_activity * 86400)]
     if status_id:
         params.append(("filter[statuses][0][status_id]", status_id))
         params.append(("filter[statuses][0][pipeline_id]",
                        _reference()["statuses"].get(status_id, {}).get("pipeline_id")))
-    leads = [ld for ld in _get_all("/leads", "leads", params) if ld.get("status_id") not in (WON, LOST)]
+    pipe = None if status_id else _pipe(pipeline_id)
+    if pipe:
+        params.append(("filter[pipeline_id][]", pipe))
+    leads = [ld for ld in _get_all("/leads", "leads", params)
+             if ld.get("status_id") not in (WON, LOST) and (not pipe or ld.get("pipeline_id") == pipe)]
     no_task = [ld for ld in leads if not ld.get("closest_task_at")]
     rows = []
     for ld in leads:
